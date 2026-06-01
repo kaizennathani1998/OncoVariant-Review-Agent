@@ -8,12 +8,13 @@ export async function POST(request: NextRequest) {
     const body = await request.json() as VariantReviewRequest;
     const normalizedVariant = normalizeVariant(body);
     const ucscUrl = ucscBrowserUrl(normalizedVariant);
+    const ucscUrls = normalizedVariant.ucscUrls;
     const [clinvar, oncokb, cbioportal] = await Promise.all([
       queryClinVar(normalizedVariant),
       queryOncoKb(normalizedVariant),
       queryCbioPortal(normalizedVariant),
     ]);
-    const partial = { normalizedVariant, ucscUrl, clinvar, oncokb, cbioportal };
+    const partial = { normalizedVariant, ucscUrl, ucscUrls, clinvar, oncokb, cbioportal };
     const aiSummary = await generateAiSummary(partial);
     return NextResponse.json({ ...partial, aiSummary } satisfies VariantReviewResponse);
   } catch (error) {
@@ -61,19 +62,19 @@ async function generateAiSummary(result: Omit<VariantReviewResponse, "aiSummary"
 function deterministicSummary(result: Omit<VariantReviewResponse, "aiSummary">) {
   const variant = result.normalizedVariant;
   const known = [
-    result.clinvar.clinicalSignificance ? `ClinVar reports: ${result.clinvar.clinicalSignificance}.` : "ClinVar did not return a definitive clinical significance field.",
+    result.clinvar.status === "not-found" ? "ClinVar exact record was not found." : result.clinvar.clinicalSignificance ? `ClinVar reports: ${result.clinvar.clinicalSignificance}.` : "ClinVar did not return a definitive clinical significance field.",
     result.oncokb.oncogenicity ? `OncoKB reports oncogenicity as: ${result.oncokb.oncogenicity}.` : "OncoKB did not return an oncogenicity field.",
-    result.cbioportal.matchingStudies.length ? `cBioPortal returned ${result.cbioportal.matchingStudies.length} matching study/studies for review.` : "cBioPortal did not return exact matching studies.",
+    result.oncokb.therapeuticImplications.length ? `OncoKB reports therapeutic implications, including ${result.oncokb.drugs.join(", ") || "drug entries"} with evidence levels as returned by OncoKB.` : "OncoKB did not return treatment entries.",
+    result.cbioportal.status === "live" ? `cBioPortal returned ${result.cbioportal.mutationCount ?? result.cbioportal.matchingStudies.length} matching mutation/study finding(s).` : result.cbioportal.status === "not-found" ? "cBioPortal did not find an exact match in the queried studies." : "cBioPortal was unavailable or could not be queried.",
   ].join(" ");
   const actionability = result.oncokb.therapeuticImplications.length || result.oncokb.drugs.length
-    ? "Potential actionability requires manual review of OncoKB evidence levels and disease context."
+    ? "OncoKB treatment entries indicate potential therapeutic relevance in the returned disease context; clinical use requires manual review of levels, labels, and disease setting."
     : "No therapy-level actionability is established from the returned source fields alone.";
 
   return [
     `What is known: ${variant.genomicHgvs}${variant.gene ? ` in ${variant.gene}` : ""} was reviewed against ClinVar, OncoKB, and cBioPortal. ${known}`,
     "What is uncertain: Source coverage may be incomplete, cancer type mapping may be approximate, and mock or fallback statuses must not be treated as evidence.",
     `Clinical actionability: ${actionability}`,
-    `Source-specific caveats: ClinVar status is ${result.clinvar.status}; OncoKB status is ${result.oncokb.status}; cBioPortal status is ${result.cbioportal.status}.`,
+    `Source-specific caveats: ClinVar status is ${result.clinvar.status}; OncoKB status is ${result.oncokb.status}; cBioPortal status is ${result.cbioportal.status}. Clinical interpretation requires tumor type, disease context, and review by qualified clinical/molecular pathology professionals.`,
   ].join("\n\n");
 }
-

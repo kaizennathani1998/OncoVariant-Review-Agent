@@ -1,6 +1,6 @@
-# OncoVariant Review Agent
+# OncoLens AI
 
-A standalone Next.js MVP for oncology variant evidence review.
+A standalone Next.js MVP for AI-assisted oncology variant review.
 
 ## Run
 
@@ -43,4 +43,3 @@ Example:
 ```
 
 This is for research support only and not a standalone clinical interpretation.
-

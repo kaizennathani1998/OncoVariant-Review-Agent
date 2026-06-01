@@ -3,7 +3,7 @@ import type { VariantReviewResponse } from "./types";
 export function buildMarkdownReport(result: VariantReviewResponse) {
   const v = result.normalizedVariant;
   return [
-    "# OncoVariant Review Agent Report",
+    "# OncoLens AI Report",
     "",
     "## Variant",
     `- Genomic: ${v.genomicHgvs}`,
@@ -11,7 +11,9 @@ export function buildMarkdownReport(result: VariantReviewResponse) {
     `- Gene: ${v.gene ?? "Not provided"}`,
     `- Protein change: ${v.proteinChange ?? "Not provided"}`,
     `- Cancer type: ${v.cancerType ?? "Not provided"}`,
-    `- UCSC Browser: ${result.ucscUrl}`,
+    `- UCSC Browser hg19: ${result.ucscUrls.hg19}`,
+    `- UCSC Browser hg38: ${result.ucscUrls.hg38}`,
+    `- Liftover: ${v.liftover.message}`,
     "",
     `## ClinVar (${result.clinvar.status})`,
     `- Clinical significance: ${result.clinvar.clinicalSignificance ?? "Not found"}`,
@@ -24,15 +26,20 @@ export function buildMarkdownReport(result: VariantReviewResponse) {
     `## OncoKB (${result.oncokb.status})`,
     `- Oncogenicity: ${result.oncokb.oncogenicity ?? "Not found"}`,
     `- Mutation effect: ${result.oncokb.mutationEffect ?? "Not found"}`,
+    `- Mutation effect description: ${result.oncokb.mutationEffectDescription ?? "Not found"}`,
+    `- Highest sensitive level: ${result.oncokb.highestSensitiveLevel ?? "Not found"}`,
+    `- Highest FDA level: ${result.oncokb.highestFdaLevel ?? "Not found"}`,
     `- Evidence level: ${result.oncokb.evidenceLevel ?? "Not found"}`,
     `- Drugs: ${result.oncokb.drugs.join(", ") || "Not found"}`,
+    `- PMIDs: ${result.oncokb.citations.join(", ") || "Not found"}`,
     "",
     `## cBioPortal (${result.cbioportal.status})`,
     `- Matching studies: ${result.cbioportal.matchingStudies.map((study) => study.name).join("; ") || "Not found"}`,
     `- Tumor types: ${result.cbioportal.tumorTypes.join(", ") || "Not found"}`,
+    `- Mutation count: ${result.cbioportal.mutationCount ?? "Not found"}`,
+    `- Protein changes: ${result.cbioportal.matchingProteinChanges.join(", ") || "Not found"}`,
     "",
     "## AI Summary",
     result.aiSummary,
   ].join("\n");
 }
-

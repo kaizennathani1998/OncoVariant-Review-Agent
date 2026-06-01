@@ -3,8 +3,8 @@ import "./globals.css";
 import { Providers } from "@/components/providers";
 
 export const metadata: Metadata = {
-  title: "OncoVariant Review Agent",
-  description: "A research-support dashboard for oncology variant evidence review.",
+  title: "OncoLens AI",
+  description: "A clinical research-support dashboard for AI-assisted oncology variant review.",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
@@ -16,4 +16,3 @@ export default function RootLayout({ children }: Readonly<{ children: React.Reac
     </html>
   );
 }
-

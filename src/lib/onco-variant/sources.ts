@@ -1,9 +1,16 @@
-import { mockCbioPortal, mockClinVar, mockOncoKb } from "./mock-data";
 import type { CbioPortalResult, ClinVarResult, NormalizedVariant, OncoKbResult } from "./types";
+import { isProteinMatch, mapReferenceGenome, parseOncoKbResponse } from "./parsers.mjs";
 
 const JSON_HEADERS = { Accept: "application/json" };
+const CBIO_BASE = "https://www.cbioportal.org";
+const ENTREZ_GENE_IDS: Record<string, number> = {
+  NPM1: 4869,
+  CSF3R: 1441,
+  TP53: 7157,
+};
 
 export async function queryClinVar(variant: NormalizedVariant): Promise<ClinVarResult> {
+  const clinvarSearchLink = clinvarVariantSearchLink(variant);
   try {
     const searchUrl = new URL("https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi");
     searchUrl.searchParams.set("db", "clinvar");
@@ -19,7 +26,8 @@ export async function queryClinVar(variant: NormalizedVariant): Promise<ClinVarR
         status: "not-found",
         gene: variant.gene,
         hgvsNames: [variant.genomicHgvs],
-        sourceLink: "https://www.ncbi.nlm.nih.gov/clinvar/",
+        sourceLink: clinvarSearchLink,
+        reviewLinks: [{ label: "ClinVar search for submitted variant", url: clinvarSearchLink }],
         caveat: "No exact ClinVar record was found for the submitted search terms.",
       };
     }
@@ -42,11 +50,22 @@ export async function queryClinVar(variant: NormalizedVariant): Promise<ClinVarR
       gene: variant.gene ?? readString(record, ["gene_sort", "genesymbol"]),
       hgvsNames: [variant.genomicHgvs],
       sourceLink: `https://www.ncbi.nlm.nih.gov/clinvar/variation/${id}/`,
+      reviewLinks: [
+        { label: "ClinVar variation page", url: `https://www.ncbi.nlm.nih.gov/clinvar/variation/${id}/` },
+        { label: "ClinVar search for submitted variant", url: clinvarSearchLink },
+      ],
       caveat: "ClinVar E-utilities fields vary by record; verify against the linked source.",
       raw: record,
     };
   } catch (error) {
-    return { ...mockClinVar, caveat: `Mock fallback data shown because ClinVar query failed: ${errorMessage(error)}` };
+    return {
+      status: "unavailable",
+      gene: variant.gene,
+      hgvsNames: [variant.genomicHgvs],
+      sourceLink: clinvarSearchLink,
+      reviewLinks: [{ label: "ClinVar search for submitted variant", url: clinvarSearchLink }],
+      caveat: `ClinVar could not be queried at this time: ${errorMessage(error)}`,
+    };
   }
 }
 
@@ -57,7 +76,12 @@ export async function queryOncoKb(variant: NormalizedVariant): Promise<OncoKbRes
       status: "missing-token",
       therapeuticImplications: [],
       drugs: [],
+      treatments: [],
+      diagnosticImplications: [],
+      prognosticImplications: [],
+      citations: [],
       sourceLink: "https://www.oncokb.org/",
+      reviewLinks: [{ label: "OncoKB home", url: "https://www.oncokb.org/" }],
       caveat: "ONCOKB_API_TOKEN is missing. Add it to .env.local to enable live OncoKB annotation.",
     };
   }
@@ -66,57 +90,140 @@ export async function queryOncoKb(variant: NormalizedVariant): Promise<OncoKbRes
       status: "not-found",
       therapeuticImplications: [],
       drugs: [],
-      sourceLink: "https://www.oncokb.org/",
+      treatments: [],
+      diagnosticImplications: [],
+      prognosticImplications: [],
+      citations: [],
+      sourceLink: variant.gene ? oncokbReviewLink(variant.gene, variant.normalizedProteinChange) : "https://www.oncokb.org/",
+      reviewLinks: variant.gene ? [{ label: "OncoKB gene/alteration page", url: oncokbReviewLink(variant.gene, variant.normalizedProteinChange) }] : [{ label: "OncoKB home", url: "https://www.oncokb.org/" }],
       caveat: "OncoKB protein-change annotation requires a gene symbol and protein alteration.",
     };
   }
   try {
     const url = new URL("https://www.oncokb.org/api/v1/annotate/mutations/byProteinChange");
     url.searchParams.set("hugoSymbol", variant.gene);
-    url.searchParams.set("alteration", variant.proteinChange.replace(/^p\./i, ""));
+    url.searchParams.set("alteration", variant.normalizedProteinChange ?? variant.proteinChange.replace(/^p\./i, ""));
+    url.searchParams.set("referenceGenome", mapReferenceGenome(variant.build));
     if (variant.cancerType) url.searchParams.set("tumorType", variant.cancerType);
     const data = await fetchJson<Record<string, unknown>>(url, { headers: { Authorization: `Bearer ${token}` } });
+    const parsed = parseOncoKbResponse(data);
     return {
       status: "live",
-      oncogenicity: readString(data, ["oncogenic", "oncogenicity"]),
-      mutationEffect: readString(data, ["mutationEffect", "effect"]),
-      biologicalEffect: readString(data, ["biologicalEffect", "variantEffect"]),
-      therapeuticImplications: [],
-      drugs: [],
-      sourceLink: `https://www.oncokb.org/gene/${variant.gene}`,
-      caveat: "OncoKB annotations depend on token access and tumor type mapping.",
+      ...parsed,
+      sourceLink: oncokbReviewLink(variant.gene, variant.normalizedProteinChange),
+      reviewLinks: [
+        { label: "OncoKB gene/alteration page", url: oncokbReviewLink(variant.gene, variant.normalizedProteinChange) },
+        { label: "OncoKB search", url: `https://www.oncokb.org/search?query=${encodeURIComponent(`${variant.gene} ${variant.normalizedProteinChange ?? ""}`)}` },
+      ],
+      caveat: variant.cancerType
+        ? "OncoKB actionability is tumor-type dependent and token/access dependent. Verify returned evidence in the linked source."
+        : "OncoKB actionability is tumor-type dependent and token/access dependent. No tumor type was supplied, so evidence may be incomplete or nonspecific.",
       raw: data,
     };
   } catch (error) {
-    return { ...mockOncoKb, caveat: `Mock fallback data shown because OncoKB query failed: ${errorMessage(error)}` };
+    return {
+      status: "unavailable",
+      therapeuticImplications: [],
+      drugs: [],
+      treatments: [],
+      diagnosticImplications: [],
+      prognosticImplications: [],
+      citations: [],
+      sourceLink: "https://www.oncokb.org/",
+      reviewLinks: variant.gene ? [{ label: "OncoKB gene/alteration page", url: oncokbReviewLink(variant.gene, variant.normalizedProteinChange) }] : [{ label: "OncoKB home", url: "https://www.oncokb.org/" }],
+      caveat: `OncoKB could not be queried at this time: ${errorMessage(error)}`,
+    };
   }
 }
 
 export async function queryCbioPortal(variant: NormalizedVariant): Promise<CbioPortalResult> {
+  const queriedStudies: CbioPortalResult["queriedStudies"] = [];
   try {
-    const studiesUrl = new URL("https://www.cbioportal.org/api/studies");
+    const studiesUrl = new URL("/api/studies", CBIO_BASE);
     studiesUrl.searchParams.set("projection", "SUMMARY");
     const studies = await fetchJson<Array<Record<string, unknown>>>(studiesUrl);
-    const needle = variant.cancerType?.toLowerCase();
-    const matching = studies.filter((study) => !needle || [readString(study, ["studyId"]), readString(study, ["name"]), readString(study, ["description"]), readString(study, ["cancerTypeId"])].join(" ").toLowerCase().includes(needle)).slice(0, 8);
-    const mapped = matching.map((study) => ({
-      studyId: readString(study, ["studyId"]) ?? "unknown",
-      name: readString(study, ["name"]) ?? "Unnamed study",
-      cancerType: readString(study, ["cancerTypeId"]),
-      sampleCount: readNumber(study, ["allSampleCount", "sequencedSampleCount", "sampleCount"]),
-      mutationFrequency: variant.gene ? "Exact variant frequency requires study molecular profile mutation fetch." : undefined,
-    }));
+    const selectedStudies = selectRelevantStudies(studies, variant).slice(0, variant.cancerType ? 8 : studies.length);
+    const entrezGeneId = variant.gene ? ENTREZ_GENE_IDS[variant.gene.toUpperCase()] : undefined;
+    if (!entrezGeneId) {
+      return unavailableCbio("cBioPortal gene lookup is not configured for this gene in the MVP.", queriedStudies);
+    }
+
+    const studyResults = [];
+    for (const study of selectedStudies) {
+      const studyId = readString(study, ["studyId"]);
+      if (!studyId) continue;
+      try {
+        const molecularProfiles = await fetchJson<Array<Record<string, unknown>>>(new URL(`/api/studies/${studyId}/molecular-profiles?projection=SUMMARY`, CBIO_BASE));
+        const mutationProfile = molecularProfiles.find((profile) => readString(profile, ["molecularAlterationType"]) === "MUTATION_EXTENDED");
+        const molecularProfileId = readString(mutationProfile, ["molecularProfileId"]);
+        const sampleLists = await fetchJson<Array<Record<string, unknown>>>(new URL(`/api/studies/${studyId}/sample-lists?projection=SUMMARY`, CBIO_BASE));
+        const sampleList = selectSampleList(sampleLists);
+        const sampleListId = readString(sampleList, ["sampleListId"]);
+        if (!molecularProfileId || !sampleListId) {
+          queriedStudies.push({ studyId, name: readString(study, ["name"]), status: "skipped", message: "No mutation profile or sequenced sample list was available." });
+          continue;
+        }
+        const mutationsUrl = new URL(`/api/molecular-profiles/${molecularProfileId}/mutations/fetch`, CBIO_BASE);
+        mutationsUrl.searchParams.set("projection", "DETAILED");
+        const mutations = await fetchJson<Array<Record<string, unknown>>>(mutationsUrl, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ entrezGeneIds: [entrezGeneId], sampleListId }),
+        });
+        const matches = mutations.map((mutation) => {
+          const observedProtein = readString(mutation, ["proteinChange", "aminoAcidChange"]) ?? "";
+          const proteinMatch = variant.proteinChangeCandidates.length ? isProteinMatch(observedProtein, variant.proteinChangeCandidates) : { matched: true, approximate: false };
+          const coordinateMatch = coordinateMatches(mutation, variant);
+          return { mutation, proteinChange: observedProtein, proteinMatch, coordinateMatch };
+        }).filter((item) => item.proteinMatch.matched || item.coordinateMatch);
+        queriedStudies.push({ studyId, name: readString(study, ["name"]), molecularProfileId, sampleListId, status: "queried", message: `${mutations.length} ${variant.gene} mutations fetched; ${matches.length} candidate match(es).` });
+        if (matches.length) {
+          const approximateMatches = matches.some((match) => match.proteinMatch.approximate && !match.coordinateMatch);
+          studyResults.push({
+            studyId,
+            name: readString(study, ["name"]) ?? studyId,
+            cancerType: readString(study, ["cancerTypeId"]),
+            sampleCount: readSampleCount(sampleList),
+            mutationCount: matches.length,
+            matchingProteinChanges: Array.from(new Set(matches.map((match) => match.proteinChange).filter(Boolean))),
+            approximateMatches,
+            link: `${CBIO_BASE}/study/summary?id=${encodeURIComponent(studyId)}`,
+            mutationFrequency: "Frequency denominator depends on the selected cBioPortal sample list.",
+            rawMatches: matches.map((match) => match.mutation),
+          });
+        }
+      } catch (error) {
+        queriedStudies.push({ studyId, name: readString(study, ["name"]), status: "error", message: errorMessage(error) });
+      }
+    }
+
+    const matchingStudies = studyResults.map((study) => {
+      const { rawMatches, ...publicStudy } = study;
+      void rawMatches;
+      return publicStudy;
+    });
+    const mutationCount = matchingStudies.reduce((sum, study) => sum + (study.mutationCount ?? 0), 0);
+    const matchingProteinChanges = Array.from(new Set(matchingStudies.flatMap((study) => study.matchingProteinChanges ?? [])));
     return {
-      status: mapped.length ? "live" : "not-found",
-      matchingStudies: mapped,
-      tumorTypes: Array.from(new Set(mapped.map((study) => study.cancerType).filter(Boolean))) as string[],
-      sampleCount: mapped.reduce((sum, study) => sum + (study.sampleCount ?? 0), 0) || undefined,
-      sourceLink: `https://www.cbioportal.org/results/mutations?case_set_id=all&Action=Submit${variant.gene ? `&gene_list=${encodeURIComponent(variant.gene)}` : ""}`,
-      caveat: mapped.length ? "This MVP lists matching public studies; exact variant-level frequency may require per-study molecular profile queries." : "No matching public cBioPortal studies were found.",
-      raw: matching,
+      status: matchingStudies.length ? "live" : "not-found",
+      matchingStudies,
+      tumorTypes: Array.from(new Set(matchingStudies.map((study) => study.cancerType).filter(Boolean))) as string[],
+      sampleCount: matchingStudies.reduce((sum, study) => sum + (study.sampleCount ?? 0), 0) || undefined,
+      mutationCount: mutationCount || undefined,
+      matchingProteinChanges,
+      queriedStudies,
+      sourceLink: `${CBIO_BASE}/results/mutations?case_set_id=all&Action=Submit${variant.gene ? `&gene_list=${encodeURIComponent(variant.gene)}` : ""}`,
+      reviewLinks: [
+        { label: "cBioPortal mutation results", url: `${CBIO_BASE}/results/mutations?case_set_id=all&Action=Submit${variant.gene ? `&gene_list=${encodeURIComponent(variant.gene)}` : ""}` },
+        ...matchingStudies.slice(0, 8).map((study) => ({ label: `${study.studyId} study page`, url: study.link ?? `${CBIO_BASE}/study/summary?id=${encodeURIComponent(study.studyId)}` })),
+      ],
+      caveat: matchingStudies.length
+        ? "cBioPortal match status is based on queried public studies and local protein/coordinate filtering; approximate protein matches are labeled in study rows."
+        : "No exact match was found in the queried cBioPortal studies.",
+      raw: { selectedStudies, studyResults },
     };
   } catch (error) {
-    return { ...mockCbioPortal, caveat: `Mock fallback data shown because cBioPortal query failed: ${errorMessage(error)}` };
+    return unavailableCbio(`cBioPortal could not be queried at this time: ${errorMessage(error)}`, queriedStudies);
   }
 }
 
@@ -149,7 +256,74 @@ function readNumber(record: unknown, keys: string[]) {
   return value ? Number(value) || undefined : undefined;
 }
 
+function readSampleCount(sampleList: unknown) {
+  return readNumber(sampleList, ["sampleCount", "allSampleCount", "sequencedSampleCount"])
+    ?? parseCountFromText(readString(sampleList, ["description", "name"]));
+}
+
+function parseCountFromText(value?: string) {
+  const match = value?.match(/\(([\d,]+)\s+samples?\)/i) ?? value?.match(/([\d,]+)\s+samples?/i);
+  return match ? Number(match[1].replace(/,/g, "")) || undefined : undefined;
+}
+
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : "Unknown error";
 }
 
+function selectRelevantStudies(studies: Array<Record<string, unknown>>, variant: NormalizedVariant) {
+  const tumor = variant.cancerType?.toLowerCase();
+  const gene = variant.gene?.toLowerCase();
+  const scored = studies.map((study) => {
+    const studyId = readString(study, ["studyId"]) ?? "";
+    const haystack = [
+      studyId,
+      readString(study, ["name"]),
+      readString(study, ["description"]),
+      readString(study, ["cancerTypeId"]),
+    ].join(" ").toLowerCase();
+    let score = 0;
+    if (tumor && (haystack.includes(tumor) || tumor === "aml" && haystack.includes("acute myeloid"))) score += 100;
+    if (/tcga|msk|aml|laml|beataml|ohsu|target/.test(studyId.toLowerCase())) score += 10;
+    if (gene && haystack.includes(gene)) score += 2;
+    return { study, score };
+  });
+  const minimum = tumor ? 100 : 0;
+  return scored.filter((item) => item.score >= minimum).sort((a, b) => b.score - a.score).map((item) => item.study);
+}
+
+function selectSampleList(sampleLists: Array<Record<string, unknown>>) {
+  return sampleLists.find((list) => /sequenced|seq|mutation/i.test(readString(list, ["sampleListId", "category", "name"]) ?? ""))
+    ?? sampleLists.find((list) => /all/i.test(readString(list, ["sampleListId", "category", "name"]) ?? ""))
+    ?? sampleLists[0];
+}
+
+function coordinateMatches(mutation: Record<string, unknown>, variant: NormalizedVariant) {
+  const start = readNumber(mutation, ["startPosition"]);
+  const chromosome = readString(mutation, ["chr", "chromosome"]);
+  const build = readString(mutation, ["ncbiBuild"]);
+  const coordinate = build?.includes("38") ? variant.hg38 : variant.hg19;
+  return Boolean(start && coordinate && start === coordinate.pos && (!chromosome || chromosome.replace(/^chr/i, "") === coordinate.chrom.replace(/^chr/i, "")));
+}
+
+function unavailableCbio(message: string, queriedStudies: CbioPortalResult["queriedStudies"]): CbioPortalResult {
+  return {
+    status: "unavailable",
+    matchingStudies: [],
+    tumorTypes: [],
+    matchingProteinChanges: [],
+    queriedStudies,
+    sourceLink: `${CBIO_BASE}/`,
+    reviewLinks: [{ label: "cBioPortal studies", url: `${CBIO_BASE}/datasets` }],
+    caveat: message,
+  };
+}
+
+function clinvarVariantSearchLink(variant: NormalizedVariant) {
+  const terms = [variant.gene, variant.genomicHgvs, variant.proteinChange].filter(Boolean).join(" ");
+  return `https://www.ncbi.nlm.nih.gov/clinvar/?term=${encodeURIComponent(terms)}`;
+}
+
+function oncokbReviewLink(gene: string, alteration?: string) {
+  const suffix = alteration ? `/${encodeURIComponent(alteration)}` : "";
+  return `https://www.oncokb.org/gene/${encodeURIComponent(gene)}${suffix}`;
+}

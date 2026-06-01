@@ -21,6 +21,10 @@ export const mockOncoKb: OncoKbResult = {
   therapeuticImplications: [],
   evidenceLevel: "Mock: unavailable",
   drugs: [],
+  treatments: [],
+  diagnosticImplications: [],
+  prognosticImplications: [],
+  citations: [],
   sourceLink: "https://www.oncokb.org/",
   caveat: "Mock fallback data shown because OncoKB was unavailable.",
 };
@@ -29,7 +33,8 @@ export const mockCbioPortal: CbioPortalResult = {
   status: "mock",
   matchingStudies: [],
   tumorTypes: [],
+  matchingProteinChanges: [],
+  queriedStudies: [],
   sourceLink: "https://www.cbioportal.org/",
   caveat: "Mock fallback data shown because cBioPortal was unavailable.",
 };
-
