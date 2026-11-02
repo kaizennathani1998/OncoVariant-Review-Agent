@@ -6,8 +6,41 @@ export function stripProteinPrefix(value = "") {
   return String(value).trim().replace(/^p\./i, "");
 }
 
+const THREE_TO_ONE = {
+  Ala: "A",
+  Arg: "R",
+  Asn: "N",
+  Asp: "D",
+  Cys: "C",
+  Gln: "Q",
+  Glu: "E",
+  Gly: "G",
+  His: "H",
+  Ile: "I",
+  Leu: "L",
+  Lys: "K",
+  Met: "M",
+  Phe: "F",
+  Pro: "P",
+  Ser: "S",
+  Thr: "T",
+  Trp: "W",
+  Tyr: "Y",
+  Val: "V",
+  Ter: "*",
+  Sec: "U",
+  Pyl: "O",
+};
+
+function normalizeThreeLetterProtein(value = "") {
+  return String(value).replace(
+    /(Ala|Arg|Asn|Asp|Cys|Gln|Glu|Gly|His|Ile|Leu|Lys|Met|Phe|Pro|Ser|Thr|Trp|Tyr|Val|Ter|Sec|Pyl)(\d+)(Ala|Arg|Asn|Asp|Cys|Gln|Glu|Gly|His|Ile|Leu|Lys|Met|Phe|Pro|Ser|Thr|Trp|Tyr|Val|Ter|Sec|Pyl)/g,
+    (_, from, pos, to) => `${THREE_TO_ONE[from] ?? from}${pos}${THREE_TO_ONE[to] ?? to}`,
+  );
+}
+
 export function normalizeProteinChange(value = "") {
-  return stripProteinPrefix(value)
+  return normalizeThreeLetterProtein(stripProteinPrefix(value))
     .replace(/Ter/gi, "*")
     .replace(/fs\*/i, "fs*")
     .replace(/\s+/g, "");
@@ -75,8 +108,14 @@ export function parseOncoKbResponse(raw = {}) {
     biologicalEffect: stringOrUndefined(raw.biologicalEffect),
     highestSensitiveLevel: stringOrUndefined(raw.highestSensitiveLevel),
     highestFdaLevel: stringOrUndefined(raw.highestFdaLevel),
+    highestResistanceLevel: stringOrUndefined(raw.highestResistanceLevel),
+    otherSignificantResistanceLevels: Array.isArray(raw.otherSignificantResistanceLevels) ? raw.otherSignificantResistanceLevels.filter(Boolean).map(String) : [],
     highestDiagnosticImplicationLevel: stringOrUndefined(raw.highestDiagnosticImplicationLevel),
     highestPrognosticImplicationLevel: stringOrUndefined(raw.highestPrognosticImplicationLevel),
+    hotspot: typeof raw.hotspot === "boolean" ? raw.hotspot : undefined,
+    tumorTypeSummary: stringOrUndefined(raw.tumorTypeSummary),
+    prognosticSummary: stringOrUndefined(raw.prognosticSummary),
+    diagnosticSummary: stringOrUndefined(raw.diagnosticSummary),
     therapeuticImplications,
     evidenceLevel: unique(therapeuticImplications.map((item) => item.level).filter(Boolean)).join(", ") || undefined,
     drugs,
@@ -122,4 +161,3 @@ function isObject(value) {
 function unique(values) {
   return Array.from(new Set(values.filter(Boolean)));
 }
-

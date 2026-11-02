@@ -15,8 +15,9 @@ Open `http://localhost:3000`.
 ## Environment
 
 ```text
-OPENAI_API_KEY=
-OPENAI_MODEL=gpt-4.1-mini
+ANTHROPIC_API_KEY=
+ANTHROPIC_BASE_URL=
+ANTHROPIC_MODEL=claude-sonnet-5
 ONCOKB_API_TOKEN=
 NCBI_API_KEY=
 ```
