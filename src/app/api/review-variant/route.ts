@@ -12,7 +12,7 @@ import {
   queryOncoKb,
   buildPracticalImportPackage,
 } from "@/lib/onco-variant/sources";
-import type { ClassificationResult, ClinVarResult, CosmicResult, CivicResult, GenieResult, VariantReviewRequest, VariantReviewResponse } from "@/lib/onco-variant/types";
+import type { ClassificationResult, ClinVarResult, CosmicResult, CivicResult, GenieResult, VariantReviewApiRequest, VariantReviewCore, VariantReviewResponse } from "@/lib/onco-variant/types";
 
 const DISCLAIMER = "This is for research support only and not a standalone clinical interpretation.";
 const REQUIRED_SECTIONS = ["Germline significance", "Somatic oncogenicity", "Somatic clinical impact", "Origin assessment", "Source-specific caveats"];
@@ -29,9 +29,38 @@ const BANNED_PHRASES = [
 ];
 
 export async function POST(request: NextRequest) {
+  const requestStarted = performance.now();
   try {
-    const body = await request.json() as VariantReviewRequest;
+    const rawBody = await request.json() as Record<string, unknown>;
+    if ("summaryFor" in rawBody) {
+      const result = rawBody.summaryFor as VariantReviewResponse | undefined;
+      if (!result?.normalizedVariant || !result.classification) {
+        return NextResponse.json({ error: "A completed variant review result is required." }, { status: 400 });
+      }
+      const { aiSummary: _summary, aiSummaryStatus: _status, queryMetadata: _metadata, ...core } = result;
+      void _summary;
+      void _status;
+      void _metadata;
+      const generated = await generateAiSummary(core);
+      return NextResponse.json(
+        { aiSummary: generated.summary, aiSummaryStatus: generated.status, durationMs: roundedMs(performance.now() - requestStarted) },
+        { headers: { "Cache-Control": "no-store" } },
+      );
+    }
+    const body = rawBody as VariantReviewApiRequest;
+    const sourceMs: Record<string, number> = {};
+    const timedSource = async <T,>(name: string, operation: () => Promise<T>) => {
+      const started = performance.now();
+      try {
+        return await operation();
+      } finally {
+        sourceMs[name] = roundedMs(performance.now() - started);
+      }
+    };
+
+    const normalizationStarted = performance.now();
     const normalizedVariant = await normalizeVariant(body);
+    const normalizationMs = roundedMs(performance.now() - normalizationStarted);
     const ucscUrl = ucscBrowserUrl(normalizedVariant);
     const ucscUrls = normalizedVariant.ucscUrls;
 
@@ -46,6 +75,7 @@ export async function POST(request: NextRequest) {
       const emptyComputationalPrediction = { status: "not_applicable" as const };
       const emptyCivic: CivicResult = { status: "not_applicable", molecularProfiles: [], evidenceItems: [], caveat: "Not queried: reference-allele validation failed before any source query." };
       const emptyCosmic: CosmicResult = { status: "not_applicable", matches: [], caveat: "Not queried: reference-allele validation failed before any source query." };
+      const classificationStarted = performance.now();
       const classification = classifyVariant({
         normalizedVariant,
         clinvar: emptyClinvar,
@@ -65,7 +95,8 @@ export async function POST(request: NextRequest) {
         civic: emptyCivic,
         cosmic: emptyCosmic,
       });
-      const partial = {
+      const classificationMs = roundedMs(performance.now() - classificationStarted);
+      const partial: VariantReviewCore = {
         normalizedVariant,
         ucscUrl,
         ucscUrls,
@@ -81,28 +112,89 @@ export async function POST(request: NextRequest) {
         classification,
       };
       const aiSummary = `Classification could not proceed: the submitted reference allele "${normalizedVariant.submittedReference}" does not match the expected reference sequence "${normalizedVariant.expectedReference ?? "unknown"}" at the submitted coordinate. No external source was queried. ${DISCLAIMER}`;
-      return NextResponse.json({ ...partial, aiSummary } satisfies VariantReviewResponse);
+      const queryMetadata = {
+        totalMs: roundedMs(performance.now() - requestStarted),
+        normalizationMs,
+        evidenceMs: 0,
+        classificationMs,
+        aiSummaryMs: 0,
+        sourceMs,
+        generatedAt: new Date().toISOString(),
+      };
+      return jsonResponse({ ...partial, aiSummary, aiSummaryStatus: "deterministic", queryMetadata } satisfies VariantReviewResponse);
     }
 
+    const evidenceStarted = performance.now();
     const [clinvar, oncokb, cbioportal, aacrGenie, gnomad, computationalPrediction, civic, cosmic] = await Promise.all([
-      queryClinVar(normalizedVariant),
-      queryOncoKb(normalizedVariant),
-      queryCbioPortal(normalizedVariant),
-      queryAacrGenie(normalizedVariant),
-      queryGnomad(normalizedVariant),
-      queryComputationalPrediction(normalizedVariant),
-      queryCivic(normalizedVariant),
-      queryCosmic(normalizedVariant),
+      timedSource("clinvar", () => queryClinVar(normalizedVariant)),
+      timedSource("oncokb", () => queryOncoKb(normalizedVariant)),
+      timedSource("cbioportal", () => queryCbioPortal(normalizedVariant)),
+      timedSource("aacrGenie", () => queryAacrGenie(normalizedVariant)),
+      timedSource("gnomad", () => queryGnomad(normalizedVariant)),
+      timedSource("computationalPrediction", () => queryComputationalPrediction(normalizedVariant)),
+      timedSource("civic", () => queryCivic(normalizedVariant)),
+      timedSource("cosmic", () => queryCosmic(normalizedVariant)),
     ]);
+    const evidenceMs = roundedMs(performance.now() - evidenceStarted);
+    const classificationStarted = performance.now();
     const classification = classifyVariant({ normalizedVariant, clinvar, oncokb, cbioportal, gnomad, computationalPrediction });
     const practicalImportPackage = buildPracticalImportPackage({ normalizedVariant, clinvar, oncokb, cbioportal, aacrGenie, gnomad, computationalPrediction, civic, cosmic });
-    const partial = { normalizedVariant, ucscUrl, ucscUrls, clinvar, oncokb, cbioportal, aacrGenie, gnomad, computationalPrediction, civic, cosmic, practicalImportPackage, classification };
-    const aiSummary = await generateAiSummary(partial);
-    return NextResponse.json({ ...partial, aiSummary } satisfies VariantReviewResponse);
+    const classificationMs = roundedMs(performance.now() - classificationStarted);
+    const includeRaw = body.includeRawEvidence === true;
+    const partial: VariantReviewCore = {
+      normalizedVariant,
+      ucscUrl,
+      ucscUrls,
+      clinvar: includeRaw ? clinvar : withoutRaw(clinvar),
+      oncokb: includeRaw ? oncokb : withoutRaw(oncokb),
+      cbioportal: includeRaw ? cbioportal : withoutRaw(cbioportal),
+      aacrGenie: includeRaw ? aacrGenie : withoutRaw(aacrGenie),
+      gnomad: includeRaw ? gnomad : withoutRaw(gnomad),
+      computationalPrediction: includeRaw ? computationalPrediction : withoutRaw(computationalPrediction),
+      civic: includeRaw ? civic : withoutRaw(civic),
+      cosmic: includeRaw ? cosmic : withoutRaw(cosmic),
+      practicalImportPackage,
+      classification,
+    };
+    const aiStarted = performance.now();
+    const summaryResult = body.includeAiSummary
+      ? await generateAiSummary(partial)
+      : { summary: deterministicSummary(partial), status: "not_requested" as const };
+    const aiSummaryMs = roundedMs(performance.now() - aiStarted);
+    const queryMetadata = {
+      totalMs: roundedMs(performance.now() - requestStarted),
+      normalizationMs,
+      evidenceMs,
+      classificationMs,
+      aiSummaryMs,
+      sourceMs,
+      generatedAt: new Date().toISOString(),
+    };
+    return jsonResponse({ ...partial, aiSummary: summaryResult.summary, aiSummaryStatus: summaryResult.status, queryMetadata } satisfies VariantReviewResponse);
   } catch (error) {
     const message = error instanceof Error ? error.message : "Unable to review variant.";
-    return NextResponse.json({ error: message }, { status: 400 });
+    return NextResponse.json({ error: message }, { status: 400, headers: { "Cache-Control": "no-store" } });
   }
+}
+
+function jsonResponse(payload: VariantReviewResponse) {
+  const timing = payload.queryMetadata;
+  return NextResponse.json(payload, {
+    headers: {
+      "Cache-Control": "no-store",
+      "Server-Timing": `normalize;dur=${timing.normalizationMs}, evidence;dur=${timing.evidenceMs}, classify;dur=${timing.classificationMs}, ai;dur=${timing.aiSummaryMs}, total;dur=${timing.totalMs}`,
+    },
+  });
+}
+
+function roundedMs(value: number) {
+  return Math.round(value * 10) / 10;
+}
+
+function withoutRaw<T extends { raw?: unknown }>(value: T): T {
+  const { raw: _raw, ...rest } = value;
+  void _raw;
+  return rest as T;
 }
 
 /** Reachable = the source could in principle return usable data; unreachable/denied/rate-limited/not-applicable are not. */
@@ -110,7 +202,7 @@ function isReachable(status: string) {
   return status === "available" || status === "not_found" || status === "not_returned";
 }
 
-function buildDigest(result: Omit<VariantReviewResponse, "aiSummary">) {
+function buildDigest(result: VariantReviewCore) {
   const variant = result.normalizedVariant;
   return {
     variant: {
@@ -160,10 +252,10 @@ function buildDigest(result: Omit<VariantReviewResponse, "aiSummary">) {
   };
 }
 
-async function generateAiSummary(result: Omit<VariantReviewResponse, "aiSummary">) {
+async function generateAiSummary(result: VariantReviewCore): Promise<{ summary: string; status: "generated" | "deterministic" }> {
   const fallback = deterministicSummary(result);
   if (!process.env.ANTHROPIC_API_KEY) {
-    return `${fallback}\n\nClaude summary generation was skipped because ANTHROPIC_API_KEY is not configured. ${DISCLAIMER}`;
+    return { summary: `${fallback}\n\nClaude summary generation was skipped because ANTHROPIC_API_KEY is not configured. ${DISCLAIMER}`, status: "deterministic" };
   }
 
   const digest = buildDigest(result);
@@ -171,6 +263,7 @@ async function generateAiSummary(result: Omit<VariantReviewResponse, "aiSummary"
     const baseUrl = process.env.ANTHROPIC_BASE_URL ?? "https://api.anthropic.com";
     const response = await fetch(`${baseUrl}/v1/messages`, {
       method: "POST",
+      signal: AbortSignal.timeout(30000),
       headers: {
         "Content-Type": "application/json",
         "x-api-key": process.env.ANTHROPIC_API_KEY,
@@ -198,7 +291,7 @@ async function generateAiSummary(result: Omit<VariantReviewResponse, "aiSummary"
     const text = data.content?.find((block) => block.type === "text")?.text;
     if (!text) {
       console.warn("Unexpected Claude response shape", JSON.stringify(data).slice(0, 500));
-      return fallback;
+      return { summary: fallback, status: "deterministic" };
     }
     if (data.stop_reason === "max_tokens") {
       console.warn("Claude response was truncated at max_tokens");
@@ -207,13 +300,13 @@ async function generateAiSummary(result: Omit<VariantReviewResponse, "aiSummary"
     const guardrailFailure = checkGuardrail(text, result.classification);
     if (guardrailFailure) {
       console.warn("AI summary guardrail rejected response", guardrailFailure);
-      return `${fallback}\n\nAI summary fallback used because the generated summary failed a safety check (${guardrailFailure}). ${DISCLAIMER}`;
+      return { summary: `${fallback}\n\nAI summary fallback used because the generated summary failed a safety check (${guardrailFailure}). ${DISCLAIMER}`, status: "deterministic" };
     }
 
-    return text;
+    return { summary: text, status: "generated" };
   } catch (error) {
     const message = error instanceof Error ? error.message : "unknown Claude error";
-    return `${fallback}\n\nAI summary fallback used because Claude generation failed: ${message}. ${DISCLAIMER}`;
+    return { summary: `${fallback}\n\nAI summary fallback used because Claude generation failed: ${message}. ${DISCLAIMER}`, status: "deterministic" };
   }
 }
 
@@ -261,14 +354,14 @@ function describeClinVarTracks(clinvar: ClinVarResult) {
   return `ClinVar reports a ${populated.join(" and a ")}.`;
 }
 
-function describeGermline(result: Omit<VariantReviewResponse, "aiSummary">) {
+function describeGermline(result: VariantReviewCore) {
   const g = result.classification.germlineSignificance;
   const notAssessedCount = g.internalComputation.criteriaNotAssessed.length;
   const totalCount = g.internalComputation.criteriaNotAssessed.length + g.internalComputation.criteriaMet.length + g.internalComputation.criteriaNotMet.length;
   return `Germline significance: primary classification is ${g.primaryClassification} (basis: ${g.classificationBasis}). Internal ACMG/AMP computation status: ${g.internalComputation.status}; ${notAssessedCount} of ${totalCount} assessed criteria could not be evaluated from available data. ${g.externalAssertions.length ? `External assertion(s): ${g.externalAssertions.map((a) => `${a.source} reports ${a.classification}`).join("; ")}.` : "No external germline assertion was found."}`;
 }
 
-function describeOncogenicity(result: Omit<VariantReviewResponse, "aiSummary">) {
+function describeOncogenicity(result: VariantReviewCore) {
   const o = result.classification.somaticOncogenicity;
   if (o.internalComputation.status === "invalid") {
     return `Somatic oncogenicity: primary classification is ${o.primaryClassification} (basis: ${o.classificationBasis}). The internal CGC-VICC computation was rejected as invalid (${o.internalComputation.validationErrors.join("; ")}); no internally-computed score is reported.`;
@@ -276,16 +369,16 @@ function describeOncogenicity(result: Omit<VariantReviewResponse, "aiSummary">) 
   return `Somatic oncogenicity: primary classification is ${o.primaryClassification} (basis: ${o.classificationBasis}). Internal CGC-VICC computation status: ${o.internalComputation.status}, score ${o.internalComputation.score ?? "n/a"}. ${o.externalAssertions.length ? `External assertion(s): ${o.externalAssertions.map((a) => `${a.source} reports ${a.classification}`).join("; ")}.` : "No external oncogenicity assertion was found."}`;
 }
 
-function describeClinicalImpact(result: Omit<VariantReviewResponse, "aiSummary">) {
+function describeClinicalImpact(result: VariantReviewCore) {
   return `Somatic clinical impact (each axis independent): ${result.classification.somaticClinicalImpact.axes.map((axis) => `${axis.axis}: ${axis.status}${axis.tier ? ` (${axis.tier})` : ""}`).join("; ")}.`;
 }
 
-function describeOrigin(result: Omit<VariantReviewResponse, "aiSummary">) {
+function describeOrigin(result: VariantReviewCore) {
   const origin = result.classification.originAssessment;
   return `Origin assessment: ${origin.conclusion} (specimen role: ${origin.specimenRole}). Germline not excluded: ${origin.germlineNotExcluded}.`;
 }
 
-function deterministicSummary(result: Omit<VariantReviewResponse, "aiSummary">) {
+function deterministicSummary(result: VariantReviewCore) {
   const variant = result.normalizedVariant;
   const known = [
     describeSource("ClinVar", result.clinvar.status, result.clinvar.caveat, describeClinVarTracks(result.clinvar)),

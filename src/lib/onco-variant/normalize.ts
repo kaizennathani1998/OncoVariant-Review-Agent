@@ -7,6 +7,7 @@ import { parseVaf } from "./vaf.ts";
 
 const VALID_BUILDS: GenomeBuild[] = ["hg19", "hg38"];
 const ENSEMBL_BASE = "https://rest.ensembl.org";
+const ENSEMBL_GRCH37_BASE = "https://grch37.rest.ensembl.org";
 const REFSEQ_CHROMOSOME_ACCESSIONS: Record<GenomeBuild, Record<string, string>> = {
   hg19: {
     chr17: "NC_000017.10",
@@ -50,11 +51,11 @@ async function validateReferenceAllele(
   const assembly = mapReferenceGenome(build);
   const chromNumber = chrom.replace(/^chr/i, "");
   const end = pos + ref.length - 1;
-  const url = new URL(`/sequence/region/human/${chromNumber}:${pos}-${end}:1`, ENSEMBL_BASE);
+  const server = build === "hg19" ? ENSEMBL_GRCH37_BASE : ENSEMBL_BASE;
+  const url = new URL(`/sequence/region/human/${chromNumber}:${pos}-${end}:1`, server);
   url.searchParams.set("content-type", "application/json");
-  url.searchParams.set("coord_system_version", assembly);
   try {
-    const data = await fetchJson<{ seq?: string }>(url, undefined, 15000);
+    const data = await fetchJson<{ seq?: string }>(url, undefined, 4000);
     const expected = data.seq?.toUpperCase();
     if (!expected) {
       return { ok: true, message: "Ensembl returned no sequence to validate the reference allele against; proceeding without this check." };
@@ -81,12 +82,12 @@ type VepAnnotation = {
 
 async function fetchVepAnnotation(genomicHgvs: string, build: GenomeBuild): Promise<VepAnnotation | undefined> {
   try {
-    const server = build === "hg19" ? "https://grch37.rest.ensembl.org" : ENSEMBL_BASE;
+    const server = build === "hg19" ? ENSEMBL_GRCH37_BASE : ENSEMBL_BASE;
     const url = new URL(`/vep/human/hgvs/${encodeURIComponent(genomicHgvs)}`, server);
     url.searchParams.set("content-type", "application/json");
     url.searchParams.set("hgvs", "1");
     url.searchParams.set("protein", "1");
-    const data = await fetchJson<Array<Record<string, unknown>>>(url, undefined, 15000);
+    const data = await fetchJson<Array<Record<string, unknown>>>(url, undefined, 5000);
     const entry = data[0] as Record<string, unknown> | undefined;
     if (!entry) return undefined;
     const transcriptConsequences = (entry.transcript_consequences as Array<Record<string, unknown>> | undefined) ?? [];
@@ -130,7 +131,16 @@ export async function normalizeVariant(input: VariantReviewRequest): Promise<Nor
     if (concept && !concept.ontologyId) warnings.push(`Submitted disease "${input.disease}" did not match a curated disease-concept alias; it is used as free text and disease-specific matching confidence is reduced.`);
   }
 
-  const referenceCheck = await validateReferenceAllele(chrom, pos, ref, build);
+  // These are independent normalization lookups. Running them together removes a full
+  // network round trip from the critical path while still blocking evidence queries until
+  // reference validation has succeeded.
+  const genomicHgvs = `${chrom}:g.${pos}${ref}>${alt}`;
+  const [referenceCheck, lifted, refSeqTranscript, vepAnnotation] = await Promise.all([
+    validateReferenceAllele(chrom, pos, ref, build),
+    liftCoordinate(chrom, pos, build),
+    gene ? resolveRefSeqTranscript(gene) : Promise.resolve(undefined),
+    fetchVepAnnotation(genomicHgvs, build),
+  ]);
   if (referenceCheck.message) warnings.push(referenceCheck.message);
 
   if (!referenceCheck.ok) {
@@ -163,12 +173,6 @@ export async function normalizeVariant(input: VariantReviewRequest): Promise<Nor
   }
 
   const primaryCoordinate = { chrom, pos, build };
-  const genomicHgvs = `${chrom}:g.${pos}${ref}>${alt}`;
-  const [lifted, refSeqTranscript, vepAnnotation] = await Promise.all([
-    liftCoordinate(chrom, pos, build),
-    gene ? resolveRefSeqTranscript(gene) : Promise.resolve(undefined),
-    fetchVepAnnotation(genomicHgvs, build),
-  ]);
   const hg19 = build === "hg19" ? primaryCoordinate : lifted.coordinate;
   const hg38 = build === "hg38" ? primaryCoordinate : lifted.coordinate;
   const normalizedProteinChange = input.proteinChange ? normalizeProteinChange(input.proteinChange) : undefined;
@@ -276,18 +280,15 @@ async function liftCoordinate(chrom: string, pos: number, build: GenomeBuild): P
   const fromAssembly = mapReferenceGenome(build);
   const toAssembly = mapReferenceGenome(targetBuild);
   const chromNumber = chrom.replace(/^chr/i, "");
-  const region = `${chromNumber}:${pos}-${pos}`;
+  // Ensembl's assembly-map endpoint expects the canonical region syntax with an explicit
+  // strand. The former dash-only syntax consistently returned HTTP 500 for GRCh37 input.
+  const region = `${chromNumber}:${pos}..${pos}:1`;
 
   const url = new URL(`/map/human/${fromAssembly}/${region}/${toAssembly}`, ENSEMBL_BASE);
   url.searchParams.set("content-type", "application/json");
 
   try {
-    let data: { mappings?: Array<{ mapped?: { seq_region_name?: string; start?: number; end?: number } }> };
-    try {
-      data = await fetchJson(url, undefined, 20000);
-    } catch {
-      data = await fetchJson(url, undefined, 20000);
-    }
+    const data = await fetchJson<{ mappings?: Array<{ mapped?: { seq_region_name?: string; start?: number; end?: number } }> }>(url, undefined, 2500);
     const mappings = data.mappings ?? [];
     const mapped = mappings[0]?.mapped;
     if (!mapped?.seq_region_name || typeof mapped.start !== "number") {

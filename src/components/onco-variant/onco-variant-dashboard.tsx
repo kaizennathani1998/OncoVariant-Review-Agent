@@ -1,16 +1,18 @@
 "use client";
 
 import type React from "react";
-import { useMemo, useState } from "react";
-import { AlertTriangle, Clipboard, Database, Download, ExternalLink, FileJson, FlaskConical, Loader2, Search, ShieldCheck, Sparkles } from "lucide-react";
+import { useMemo, useRef, useState } from "react";
+import { AlertTriangle, CheckCircle2, Clipboard, Database, Download, ExternalLink, FileJson, FileUp, Files, FlaskConical, Gauge, Loader2, Search, ShieldCheck, Sparkles, Square, UploadCloud, XCircle } from "lucide-react";
 import { buildMarkdownReport } from "@/lib/onco-variant/report";
-import type { ClinVarClassification, CriterionOutcome, GenomeBuild, SourceStatus, SpecimenMaterial, VariantReviewRequest, VariantReviewResponse } from "@/lib/onco-variant/types";
+import { MAX_VCF_BYTES, parseVcf, type ParsedVcfVariant, type VcfParseResult } from "@/lib/onco-variant/vcf";
+import type { ClinVarClassification, CriterionOutcome, GenomeBuild, SourceStatus, SpecimenMaterial, VariantReviewApiRequest, VariantReviewRequest, VariantReviewResponse } from "@/lib/onco-variant/types";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Separator } from "@/components/ui/separator";
+import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 
 const EXAMPLE: VariantReviewRequest = {
@@ -43,31 +45,192 @@ const NPM1_EXAMPLE: FormState = {
   vaf: "0.35",
 };
 
+type BatchItemStatus = "queued" | "running" | "complete" | "error" | "cancelled";
+type BatchItem = {
+  variant: ParsedVcfVariant;
+  status: BatchItemStatus;
+  result?: VariantReviewResponse;
+  error?: string;
+};
+
+type BatchContext = {
+  disease: string;
+  cancerType: string;
+  specimenMaterial: SpecimenMaterial;
+  build: GenomeBuild;
+  includeFiltered: boolean;
+};
+
+const INITIAL_BATCH_CONTEXT: BatchContext = {
+  disease: "",
+  cancerType: "",
+  specimenMaterial: "unknown",
+  build: "hg38",
+  includeFiltered: true,
+};
+
 export function OncoVariantDashboard() {
+  const [mode, setMode] = useState<"single" | "batch">("single");
   const [form, setForm] = useState<FormState>(INITIAL_FORM);
   const [result, setResult] = useState<VariantReviewResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [isAiLoading, setIsAiLoading] = useState(false);
   const [copied, setCopied] = useState<string | null>(null);
+  const [vcf, setVcf] = useState<VcfParseResult | null>(null);
+  const [batchContext, setBatchContext] = useState<BatchContext>(INITIAL_BATCH_CONTEXT);
+  const [batchItems, setBatchItems] = useState<BatchItem[]>([]);
+  const [batchRunning, setBatchRunning] = useState(false);
+  const [selectedBatchKey, setSelectedBatchKey] = useState<string | null>(null);
+  const [batchSearch, setBatchSearch] = useState("");
+  const batchAbortRef = useRef<AbortController | null>(null);
   const requestBody = useMemo<VariantReviewRequest>(() => ({ ...form, pos: Number(form.pos), vaf: form.vaf?.trim() ? form.vaf : undefined }), [form]);
+  const batchCounts = useMemo(() => ({
+    complete: batchItems.filter((item) => item.status === "complete").length,
+    running: batchItems.filter((item) => item.status === "running").length,
+    error: batchItems.filter((item) => item.status === "error").length,
+    finished: batchItems.filter((item) => item.status === "complete" || item.status === "error" || item.status === "cancelled").length,
+  }), [batchItems]);
+  const visibleBatchItems = useMemo(() => {
+    const term = batchSearch.trim().toLowerCase();
+    if (!term) return batchItems;
+    return batchItems.filter(({ variant }) => [variant.gene, variant.proteinChange, variant.id, `${variant.chrom}:${variant.pos}`].some((value) => value?.toLowerCase().includes(term)));
+  }, [batchItems, batchSearch]);
+  const selectedBatchItem = batchItems.find((item) => item.variant.key === selectedBatchKey);
 
   async function submitReview() {
     setIsLoading(true);
     setError(null);
     try {
-      const response = await fetch("/api/review-variant", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(requestBody),
-      });
-      const payload = await response.json();
-      if (!response.ok) throw new Error(payload.error ?? "Variant review failed.");
-      setResult(payload as VariantReviewResponse);
+      const payload = await requestVariantReview(requestBody);
+      setResult(payload);
+      void generateAiSummaryFor(payload);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Variant review failed.");
     } finally {
       setIsLoading(false);
     }
+  }
+
+  async function handleVcfFile(file: File | undefined) {
+    if (!file) return;
+    setError(null);
+    setBatchItems([]);
+    setSelectedBatchKey(null);
+    setResult(null);
+    try {
+      if (file.size > MAX_VCF_BYTES) throw new Error(`VCF exceeds the ${Math.round(MAX_VCF_BYTES / 1024 / 1024)} MB upload limit.`);
+      const parsed = parseVcf(await file.text(), file.name);
+      setVcf(parsed);
+      if (parsed.detectedBuild) setBatchContext((current) => ({ ...current, build: parsed.detectedBuild! }));
+    } catch (err) {
+      setVcf(null);
+      setError(err instanceof Error ? err.message : "Unable to parse the VCF.");
+    }
+  }
+
+  async function startBatchReview() {
+    if (!vcf) return;
+    if (!batchContext.disease.trim()) {
+      setError("Enter the disease or diagnosis before starting a VCF batch review.");
+      return;
+    }
+    const reviewable = vcf.variants.filter((variant) => variant.supported && (batchContext.includeFiltered || variant.passed));
+    if (!reviewable.length) {
+      setError("This VCF has no supported small variants under the selected filter settings.");
+      return;
+    }
+    setError(null);
+    const initialItems = reviewable.map((variant): BatchItem => ({ variant, status: "queued" }));
+    setBatchItems(initialItems);
+    setSelectedBatchKey(null);
+    setResult(null);
+    setBatchRunning(true);
+    const controller = new AbortController();
+    batchAbortRef.current = controller;
+    let cursor = 0;
+
+    const worker = async () => {
+      while (cursor < initialItems.length && !controller.signal.aborted) {
+        const item = initialItems[cursor++];
+        updateBatchItem(item.variant.key, { status: "running", error: undefined });
+        try {
+          const review = await requestVariantReview({
+            chrom: item.variant.chrom,
+            pos: item.variant.pos,
+            ref: item.variant.ref,
+            alt: item.variant.alt,
+            build: batchContext.build,
+            gene: item.variant.gene,
+            proteinChange: item.variant.proteinChange,
+            disease: batchContext.disease.trim(),
+            cancerType: batchContext.cancerType.trim() || undefined,
+            specimenMaterial: batchContext.specimenMaterial,
+            vaf: item.variant.vaf,
+          }, controller.signal);
+          updateBatchItem(item.variant.key, { status: "complete", result: review });
+          setSelectedBatchKey((current) => current ?? item.variant.key);
+          setResult((current) => current ?? review);
+        } catch (err) {
+          const aborted = controller.signal.aborted;
+          updateBatchItem(item.variant.key, {
+            status: aborted ? "cancelled" : "error",
+            error: aborted ? "Batch cancelled" : err instanceof Error ? err.message : "Variant review failed.",
+          });
+        }
+      }
+    };
+
+    try {
+      await Promise.all(Array.from({ length: Math.min(2, initialItems.length) }, worker));
+    } finally {
+      if (controller.signal.aborted) {
+        setBatchItems((items) => items.map((item) => item.status === "queued" || item.status === "running" ? { ...item, status: "cancelled" } : item));
+      }
+      setBatchRunning(false);
+      batchAbortRef.current = null;
+    }
+  }
+
+  function cancelBatchReview() {
+    batchAbortRef.current?.abort();
+    setBatchRunning(false);
+  }
+
+  function selectBatchItem(item: BatchItem) {
+    setSelectedBatchKey(item.variant.key);
+    setResult(item.result ?? null);
+    setError(item.error ?? null);
+  }
+
+  async function generateAiSummaryFor(target: VariantReviewResponse, batchKey?: string) {
+    if (target.aiSummaryStatus === "generated") return;
+    setIsAiLoading(true);
+    try {
+      const response = await fetch("/api/review-variant", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ summaryFor: target }),
+      });
+      const payload = await response.json() as { aiSummary?: string; aiSummaryStatus?: VariantReviewResponse["aiSummaryStatus"]; durationMs?: number; error?: string };
+      if (!response.ok || !payload.aiSummary || !payload.aiSummaryStatus) throw new Error(payload.error ?? "AI summary generation failed.");
+      const updated: VariantReviewResponse = {
+        ...target,
+        aiSummary: payload.aiSummary,
+        aiSummaryStatus: payload.aiSummaryStatus,
+        queryMetadata: { ...target.queryMetadata, aiSummaryMs: payload.durationMs ?? target.queryMetadata.aiSummaryMs },
+      };
+      if (batchKey) updateBatchItem(batchKey, { result: updated });
+      setResult((current) => current?.normalizedVariant.genomicHgvs === target.normalizedVariant.genomicHgvs ? updated : current);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "AI summary generation failed.");
+    } finally {
+      setIsAiLoading(false);
+    }
+  }
+
+  function updateBatchItem(key: string, patch: Partial<BatchItem>) {
+    setBatchItems((items) => items.map((item) => item.variant.key === key ? { ...item, ...patch } : item));
   }
 
   async function copyJson() {
@@ -136,51 +299,87 @@ export function OncoVariantDashboard() {
           </div>
           <Card className="rounded-lg border-border/80 bg-card shadow-sm">
             <CardHeader>
-              <CardTitle>Case variant input</CardTitle>
-              <CardDescription>Enter variant coordinates and disease context for source-specific evidence review.</CardDescription>
+              <CardTitle>Start a molecular evidence review</CardTitle>
+              <CardDescription>Review one variant or import a VCF for a progress-tracked multi-variant workspace.</CardDescription>
             </CardHeader>
             <CardContent>
-              <div className="mb-4 flex justify-start sm:justify-end">
-                <div className="flex flex-wrap gap-2">
-                  <Button variant="outline" onClick={() => setForm(NPM1_EXAMPLE)}><Sparkles data-icon="inline-start" />NPM1 AML</Button>
-                  <Button variant="outline" onClick={() => setForm(INITIAL_FORM)}><Sparkles data-icon="inline-start" />TP53 R175H</Button>
-                </div>
-              </div>
-              <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-8">
-                <Field label="Chromosome"><Input value={form.chrom} onChange={(e) => update("chrom", e.target.value)} /></Field>
-                <Field label="Position"><Input value={form.pos} onChange={(e) => update("pos", e.target.value)} inputMode="numeric" /></Field>
-                <Field label="Ref"><Input value={form.ref} onChange={(e) => update("ref", e.target.value)} /></Field>
-                <Field label="Alt"><Input value={form.alt} onChange={(e) => update("alt", e.target.value)} /></Field>
-                <Field label="Build">
-                  <select className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50" value={form.build} onChange={(e) => update("build", e.target.value as GenomeBuild)}>
-                    <option value="hg19">hg19</option>
-                    <option value="hg38">hg38</option>
-                  </select>
-                </Field>
-                <Field label="Gene"><Input value={form.gene ?? ""} onChange={(e) => update("gene", e.target.value)} /></Field>
-                <Field label="Protein"><Input value={form.proteinChange ?? ""} onChange={(e) => update("proteinChange", e.target.value)} /></Field>
-                <Field label="Tumor code"><Input value={form.cancerType ?? ""} onChange={(e) => update("cancerType", e.target.value)} placeholder="e.g. AML" /></Field>
-                <Field label="Diagnosis"><Input value={form.disease ?? ""} onChange={(e) => update("disease", e.target.value)} placeholder="e.g. Acute myeloid leukemia" /></Field>
-                <Field label="Specimen">
-                  <select className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50" value={form.specimenMaterial ?? "unknown"} onChange={(e) => update("specimenMaterial", e.target.value as SpecimenMaterial)}>
-                    <option value="unknown">Unknown</option>
-                    <option value="bone_marrow">Bone marrow</option>
-                    <option value="peripheral_blood">Peripheral blood</option>
-                    <option value="solid_tumor_tissue">Solid tumor tissue</option>
-                    <option value="constitutional_tissue">Constitutional tissue</option>
-                    <option value="buccal_swab">Buccal swab</option>
-                    <option value="saliva">Saliva</option>
-                    <option value="cultured_fibroblasts">Cultured fibroblasts</option>
-                  </select>
-                </Field>
-                <Field label="VAF"><Input value={form.vaf ?? ""} onChange={(e) => update("vaf", e.target.value)} placeholder="e.g. 0.42 or 42%" /></Field>
-              </div>
-              <div className="mt-4 flex flex-col justify-between gap-3 border-t border-border pt-4 sm:flex-row sm:items-center">
-                <p className="text-xs text-muted-foreground">API keys stay server-side in <code>.env.local</code>. Mock fields are explicitly labeled.</p>
-                <Button onClick={submitReview} disabled={isLoading}>{isLoading ? <Loader2 data-icon="inline-start" className="animate-spin" /> : <Search data-icon="inline-start" />}Review variant</Button>
-              </div>
+              <Tabs value={mode} onValueChange={(value) => setMode(value as "single" | "batch")}>
+                <TabsList className="mb-5 h-10 w-full max-w-md">
+                  <TabsTrigger value="single" className="py-2"><Search data-icon="inline-start" />Single variant</TabsTrigger>
+                  <TabsTrigger value="batch" className="py-2"><Files data-icon="inline-start" />VCF batch</TabsTrigger>
+                </TabsList>
+                <TabsContent value="single">
+                  <div className="mb-4 flex justify-start sm:justify-end">
+                    <div className="flex flex-wrap gap-2">
+                      <Button variant="outline" onClick={() => setForm(NPM1_EXAMPLE)}><Sparkles data-icon="inline-start" />NPM1 AML</Button>
+                      <Button variant="outline" onClick={() => setForm(INITIAL_FORM)}><Sparkles data-icon="inline-start" />TP53 R175H</Button>
+                    </div>
+                  </div>
+                  <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-8">
+                    <Field label="Chromosome"><Input value={form.chrom} onChange={(e) => update("chrom", e.target.value)} /></Field>
+                    <Field label="Position"><Input value={form.pos} onChange={(e) => update("pos", e.target.value)} inputMode="numeric" /></Field>
+                    <Field label="Ref"><Input value={form.ref} onChange={(e) => update("ref", e.target.value)} /></Field>
+                    <Field label="Alt"><Input value={form.alt} onChange={(e) => update("alt", e.target.value)} /></Field>
+                    <Field label="Build"><BuildSelect value={form.build} onChange={(value) => update("build", value)} /></Field>
+                    <Field label="Gene"><Input value={form.gene ?? ""} onChange={(e) => update("gene", e.target.value)} /></Field>
+                    <Field label="Protein"><Input value={form.proteinChange ?? ""} onChange={(e) => update("proteinChange", e.target.value)} /></Field>
+                    <Field label="Tumor code"><Input value={form.cancerType ?? ""} onChange={(e) => update("cancerType", e.target.value)} placeholder="e.g. AML" /></Field>
+                    <Field label="Diagnosis"><Input value={form.disease ?? ""} onChange={(e) => update("disease", e.target.value)} placeholder="e.g. Acute myeloid leukemia" /></Field>
+                    <Field label="Specimen"><SpecimenSelect value={form.specimenMaterial ?? "unknown"} onChange={(value) => update("specimenMaterial", value)} /></Field>
+                    <Field label="VAF"><Input value={form.vaf ?? ""} onChange={(e) => update("vaf", e.target.value)} placeholder="e.g. 0.42 or 42%" /></Field>
+                  </div>
+                  <div className="mt-4 flex flex-col justify-between gap-3 border-t border-border pt-4 sm:flex-row sm:items-center">
+                    <p className="text-xs text-muted-foreground">Evidence returns first; AI narration is generated in the background.</p>
+                    <Button onClick={submitReview} disabled={isLoading}>{isLoading ? <Loader2 data-icon="inline-start" className="animate-spin" /> : <Search data-icon="inline-start" />}Review variant</Button>
+                  </div>
+                </TabsContent>
+                <TabsContent value="batch">
+                  <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_minmax(360px,0.8fr)]">
+                    <label className="group flex min-h-48 cursor-pointer flex-col items-center justify-center rounded-xl border border-dashed border-primary/40 bg-primary/5 p-6 text-center transition hover:border-primary hover:bg-primary/10">
+                      <input className="sr-only" type="file" accept=".vcf,text/plain" onChange={(event) => void handleVcfFile(event.target.files?.[0])} />
+                      <span className="flex size-12 items-center justify-center rounded-xl bg-primary/15 text-primary"><UploadCloud className="size-6" /></span>
+                      <span className="mt-3 font-medium">Choose a VCF file</span>
+                      <span className="mt-1 max-w-md text-sm text-muted-foreground">Mutect2/VEP and Ion Reporter/Oncomine annotations are detected automatically. Files are parsed locally in your browser.</span>
+                      <span className="mt-3 text-xs text-muted-foreground">VCF · up to {Math.round(MAX_VCF_BYTES / 1024 / 1024)} MB · 5,000 records</span>
+                    </label>
+                    <div className="grid content-start gap-3">
+                      {vcf ? <VcfImportSummary vcf={vcf} /> : <div className="rounded-xl border border-border bg-muted/25 p-5 text-sm text-muted-foreground">Upload a VCF to inspect its assembly, annotations, filters, and reviewable record count before any external query starts.</div>}
+                    </div>
+                  </div>
+                  {vcf ? (
+                    <div className="mt-5 border-t border-border pt-5">
+                      <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                        <Field label="Disease / diagnosis *"><Input value={batchContext.disease} onChange={(event) => setBatchContext((current) => ({ ...current, disease: event.target.value }))} placeholder="e.g. Acute myeloid leukemia" /></Field>
+                        <Field label="Tumor code"><Input value={batchContext.cancerType} onChange={(event) => setBatchContext((current) => ({ ...current, cancerType: event.target.value }))} placeholder="e.g. AML" /></Field>
+                        <Field label="Genome build"><BuildSelect value={batchContext.build} onChange={(build) => setBatchContext((current) => ({ ...current, build }))} /></Field>
+                        <Field label="Specimen"><SpecimenSelect value={batchContext.specimenMaterial} onChange={(specimenMaterial) => setBatchContext((current) => ({ ...current, specimenMaterial }))} /></Field>
+                      </div>
+                      <div className="mt-4 flex flex-col justify-between gap-4 rounded-xl border border-border bg-muted/25 p-4 sm:flex-row sm:items-center">
+                        <div className="flex items-center gap-3">
+                          <Switch checked={batchContext.includeFiltered} onCheckedChange={(includeFiltered) => setBatchContext((current) => ({ ...current, includeFiltered }))} aria-label="Include filtered variants" />
+                          <div><p className="text-sm font-medium">Include filtered calls</p><p className="text-xs text-muted-foreground">Off reviews only PASS records; unsupported fusions remain visible but are never queried.</p></div>
+                        </div>
+                        {batchRunning ? <Button variant="destructive" onClick={cancelBatchReview}><Square data-icon="inline-start" />Cancel batch</Button> : <Button onClick={() => void startBatchReview()}><FileUp data-icon="inline-start" />Review {vcf.variants.filter((variant) => variant.supported && (batchContext.includeFiltered || variant.passed)).length.toLocaleString()} variants</Button>}
+                      </div>
+                    </div>
+                  ) : null}
+                </TabsContent>
+              </Tabs>
             </CardContent>
           </Card>
+          {batchItems.length ? (
+            <BatchNavigator
+              items={visibleBatchItems}
+              totalItems={batchItems.length}
+              selectedKey={selectedBatchKey}
+              selectedItem={selectedBatchItem}
+              search={batchSearch}
+              onSearch={setBatchSearch}
+              onSelect={selectBatchItem}
+              counts={batchCounts}
+              running={batchRunning}
+            />
+          ) : null}
         </div>
       </div>
       <div className="mx-auto flex max-w-7xl flex-col gap-5 px-4 py-6 sm:px-6 lg:px-8">
@@ -200,7 +399,7 @@ export function OncoVariantDashboard() {
         <div className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_380px]">
           <Card className="rounded-lg border-border/80">
             <CardHeader><CardTitle>Evidence workspace</CardTitle><CardDescription>Source records, source caveats, and summary text generated only from retrieved data.</CardDescription></CardHeader>
-            <CardContent>{isLoading ? <LoadingState /> : result ? <EvidenceTabs result={result} /> : <EmptyState />}</CardContent>
+            <CardContent>{isLoading ? <LoadingState /> : result ? <EvidenceTabs result={result} isAiLoading={isAiLoading} onGenerateAi={() => void generateAiSummaryFor(result, selectedBatchItem?.variant.key)} /> : <EmptyState />}</CardContent>
           </Card>
           <div className="flex flex-col gap-5">
             <Card className="rounded-lg border-border/80">
@@ -246,6 +445,130 @@ export function OncoVariantDashboard() {
   function update<K extends keyof FormState>(key: K, value: FormState[K]) {
     setForm((current) => ({ ...current, [key]: value }));
   }
+}
+
+async function requestVariantReview(request: VariantReviewRequest, signal?: AbortSignal) {
+  const apiRequest: VariantReviewApiRequest = { ...request, includeAiSummary: false, includeRawEvidence: false };
+  const response = await fetch("/api/review-variant", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(apiRequest),
+    signal,
+  });
+  const payload = await response.json() as VariantReviewResponse & { error?: string };
+  if (!response.ok) throw new Error(payload.error ?? "Variant review failed.");
+  return payload;
+}
+
+function BuildSelect({ value, onChange }: { value: GenomeBuild; onChange: (value: GenomeBuild) => void }) {
+  return (
+    <select className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50" value={value} onChange={(event) => onChange(event.target.value as GenomeBuild)}>
+      <option value="hg19">hg19 / GRCh37</option>
+      <option value="hg38">hg38 / GRCh38</option>
+    </select>
+  );
+}
+
+function SpecimenSelect({ value, onChange }: { value: SpecimenMaterial; onChange: (value: SpecimenMaterial) => void }) {
+  return (
+    <select className="h-8 w-full rounded-lg border border-input bg-transparent px-2.5 text-sm outline-none focus-visible:border-ring focus-visible:ring-3 focus-visible:ring-ring/50" value={value} onChange={(event) => onChange(event.target.value as SpecimenMaterial)}>
+      <option value="unknown">Unknown</option>
+      <option value="bone_marrow">Bone marrow</option>
+      <option value="peripheral_blood">Peripheral blood</option>
+      <option value="solid_tumor_tissue">Solid tumor tissue</option>
+      <option value="constitutional_tissue">Constitutional tissue</option>
+      <option value="buccal_swab">Buccal swab</option>
+      <option value="saliva">Saliva</option>
+      <option value="cultured_fibroblasts">Cultured fibroblasts</option>
+    </select>
+  );
+}
+
+function VcfImportSummary({ vcf }: { vcf: VcfParseResult }) {
+  return (
+    <div className="rounded-xl border border-border bg-muted/25 p-4">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0"><p className="truncate font-medium">{vcf.fileName}</p><p className="mt-1 text-xs text-muted-foreground">{vcf.sampleNames.length ? `Sample: ${vcf.sampleNames.join(", ")}` : "Sites-only VCF"}</p></div>
+        <Badge variant={vcf.detectedBuild ? "default" : "destructive"}>{vcf.detectedBuild ?? "build unknown"}</Badge>
+      </div>
+      <div className="mt-4 grid grid-cols-2 gap-2 sm:grid-cols-4 xl:grid-cols-2">
+        <MiniFact label="Records" value={vcf.stats.records.toLocaleString()} />
+        <MiniFact label="PASS" value={vcf.stats.passing.toLocaleString()} />
+        <MiniFact label="Reviewable" value={vcf.stats.supported.toLocaleString()} />
+        <MiniFact label="Unsupported" value={vcf.stats.unsupported.toLocaleString()} />
+      </div>
+      <p className="mt-3 text-xs text-muted-foreground">Build detection: {vcf.buildEvidence}</p>
+      {vcf.stats.unsupported ? (
+        <details className="mt-3 rounded-lg border border-border bg-background/40 p-3">
+          <summary className="cursor-pointer text-xs font-medium">{vcf.stats.unsupported} unsupported structural/fusion record{vcf.stats.unsupported === 1 ? "" : "s"} retained</summary>
+          <div className="mt-2 grid max-h-40 gap-2 overflow-y-auto">
+            {vcf.variants.filter((variant) => !variant.supported).slice(0, 50).map((variant) => (
+              <div key={variant.key} className="rounded-md border border-border p-2 text-xs">
+                <span className="font-medium">{variant.gene ?? variant.id ?? "Unannotated"}</span>
+                <span className="ml-2 font-mono text-muted-foreground">{variant.chrom}:{variant.pos}</span>
+                <p className="mt-1 text-muted-foreground">{variant.unsupportedReason}</p>
+              </div>
+            ))}
+          </div>
+        </details>
+      ) : null}
+      {vcf.stats.supported > 100 ? <div className="mt-3 rounded-lg border border-amber-400/30 bg-amber-400/10 p-3 text-xs text-amber-200">Large batch: reviews run two at a time to protect external evidence services. You can cancel without losing completed results.</div> : null}
+      {vcf.warnings.length ? <div className="mt-3 rounded-lg border border-destructive/30 bg-destructive/10 p-3 text-xs text-destructive">{vcf.warnings.join(" ")}</div> : null}
+    </div>
+  );
+}
+
+function BatchNavigator({
+  items,
+  totalItems,
+  selectedKey,
+  selectedItem,
+  search,
+  onSearch,
+  onSelect,
+  counts,
+  running,
+}: {
+  items: BatchItem[];
+  totalItems: number;
+  selectedKey: string | null;
+  selectedItem?: BatchItem;
+  search: string;
+  onSearch: (value: string) => void;
+  onSelect: (item: BatchItem) => void;
+  counts: { complete: number; running: number; error: number; finished: number };
+  running: boolean;
+}) {
+  const progress = totalItems ? Math.round((counts.finished / totalItems) * 100) : 0;
+  return (
+    <Card className="overflow-hidden rounded-xl border-primary/20 bg-card/90">
+      <div className="grid lg:grid-cols-[320px_minmax(0,1fr)]">
+        <div className="border-b border-border p-4 lg:border-r lg:border-b-0">
+          <div className="flex items-center justify-between gap-3"><div><p className="font-medium">VCF review queue</p><p className="text-xs text-muted-foreground">{counts.complete} complete · {counts.running} running · {counts.error} errors</p></div>{running ? <Loader2 className="size-4 animate-spin text-primary" /> : <CheckCircle2 className="size-4 text-primary" />}</div>
+          <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-muted"><div className="h-full rounded-full bg-primary transition-all" style={{ width: `${progress}%` }} /></div>
+          <div className="relative mt-3"><Search className="absolute top-1/2 left-2.5 size-4 -translate-y-1/2 text-muted-foreground" /><Input className="pl-8" value={search} onChange={(event) => onSearch(event.target.value)} placeholder="Search gene, protein, coordinate" /></div>
+        </div>
+        <div className="min-w-0 p-4">
+          <div className="mb-3 flex items-center justify-between gap-3"><p className="text-sm font-medium">{items.length.toLocaleString()} of {totalItems.toLocaleString()} variants</p><p className="text-xs text-muted-foreground">{progress}% processed</p></div>
+          <div className="flex max-h-44 gap-2 overflow-x-auto pb-2 lg:max-h-52 lg:flex-wrap lg:overflow-y-auto lg:pr-1">
+            {items.map((item) => <BatchVariantButton key={item.variant.key} item={item} selected={item.variant.key === selectedKey} onClick={() => onSelect(item)} />)}
+          </div>
+          {selectedItem && !selectedItem.result ? <p className="mt-2 text-xs text-muted-foreground">Selected variant is {selectedItem.status}. Results open here as soon as its evidence review finishes.</p> : null}
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+function BatchVariantButton({ item, selected, onClick }: { item: BatchItem; selected: boolean; onClick: () => void }) {
+  const icon = item.status === "complete" ? <CheckCircle2 className="size-3.5 text-primary" /> : item.status === "error" ? <XCircle className="size-3.5 text-destructive" /> : item.status === "running" ? <Loader2 className="size-3.5 animate-spin text-primary" /> : <span className="size-2 rounded-full bg-muted-foreground/40" />;
+  return (
+    <button type="button" onClick={onClick} className={`min-w-44 rounded-lg border p-3 text-left transition ${selected ? "border-primary bg-primary/10" : "border-border bg-background/50 hover:border-primary/50"}`}>
+      <span className="flex items-center justify-between gap-2"><span className="truncate text-sm font-medium">{item.variant.gene ?? "Unannotated"}</span>{icon}</span>
+      <span className="mt-1 block truncate font-mono text-xs text-muted-foreground">{item.variant.proteinChange ?? `${item.variant.chrom}:${item.variant.pos}`}</span>
+      <span className="mt-1 block text-[11px] uppercase tracking-wide text-muted-foreground">{item.status}</span>
+    </button>
+  );
 }
 
 function NormalizedReview({ result }: { result: VariantReviewResponse }) {
@@ -364,25 +687,26 @@ function SummaryCard({ title, value, detail, icon: Icon, status }: { title: stri
   );
 }
 
-function EvidenceTabs({ result }: { result: VariantReviewResponse }) {
+function EvidenceTabs({ result, isAiLoading, onGenerateAi }: { result: VariantReviewResponse; isAiLoading: boolean; onGenerateAi: () => void }) {
   return (
-    <Tabs defaultValue="classification">
-      <TabsList className="h-auto w-full justify-start overflow-x-auto rounded-lg">
-        <TabsTrigger value="classification" className="px-3 py-2">Classification</TabsTrigger>
-        <TabsTrigger value="clinvar" className="px-3 py-2">ClinVar</TabsTrigger>
-        <TabsTrigger value="oncokb" className="px-3 py-2">OncoKB</TabsTrigger>
-        <TabsTrigger value="cbioportal" className="px-3 py-2">cBioPortal</TabsTrigger>
-        <TabsTrigger value="genie" className="px-3 py-2">GENIE</TabsTrigger>
-        <TabsTrigger value="gnomad" className="px-3 py-2">gnomAD</TabsTrigger>
-        <TabsTrigger value="civic" className="px-3 py-2">CIViC</TabsTrigger>
-        <TabsTrigger value="cosmic" className="px-3 py-2">COSMIC</TabsTrigger>
-        <TabsTrigger value="imports" className="px-3 py-2">Import Package</TabsTrigger>
-        <TabsTrigger value="guide" className="px-3 py-2">Criteria Guide</TabsTrigger>
-        <TabsTrigger value="computational" className="px-3 py-2">REVEL / AlphaMissense</TabsTrigger>
-        <TabsTrigger value="summary" className="px-3 py-2">AI Summary</TabsTrigger>
+    <Tabs defaultValue="classification" className="lg:grid lg:grid-cols-[210px_minmax(0,1fr)] lg:items-start lg:gap-5 lg:[&_[data-slot=tabs-content]]:col-start-2 lg:[&_[data-slot=tabs-content]]:row-start-1">
+      <TabsList className="h-auto w-full justify-start overflow-x-auto rounded-lg lg:sticky lg:top-4 lg:col-start-1 lg:row-start-1 lg:flex-col lg:items-stretch lg:overflow-visible lg:p-2">
+        <TabsTrigger value="classification" className="px-3 py-2 lg:w-full lg:justify-start"><ShieldCheck />Interpretation</TabsTrigger>
+        <TabsTrigger value="clinvar" className="px-3 py-2 lg:w-full lg:justify-between"><SourceNavLabel label="ClinVar" status={result.clinvar.status} /></TabsTrigger>
+        <TabsTrigger value="oncokb" className="px-3 py-2 lg:w-full lg:justify-between"><SourceNavLabel label="OncoKB" status={result.oncokb.status} /></TabsTrigger>
+        <TabsTrigger value="cbioportal" className="px-3 py-2 lg:w-full lg:justify-between"><SourceNavLabel label="cBioPortal" status={result.cbioportal.status} /></TabsTrigger>
+        <TabsTrigger value="genie" className="px-3 py-2 lg:w-full lg:justify-between"><SourceNavLabel label="GENIE" status={result.aacrGenie.status} /></TabsTrigger>
+        <TabsTrigger value="gnomad" className="px-3 py-2 lg:w-full lg:justify-between"><SourceNavLabel label="gnomAD" status={result.gnomad.status} /></TabsTrigger>
+        <TabsTrigger value="civic" className="px-3 py-2 lg:w-full lg:justify-between"><SourceNavLabel label="CIViC" status={result.civic.status} /></TabsTrigger>
+        <TabsTrigger value="cosmic" className="px-3 py-2 lg:w-full lg:justify-between"><SourceNavLabel label="COSMIC" status={result.cosmic.status} /></TabsTrigger>
+        <TabsTrigger value="computational" className="px-3 py-2 lg:w-full lg:justify-between"><SourceNavLabel label="Predictions" status={result.computationalPrediction.status} /></TabsTrigger>
+        <TabsTrigger value="summary" className="px-3 py-2 lg:w-full lg:justify-start"><Sparkles />AI narrative</TabsTrigger>
+        <TabsTrigger value="imports" className="px-3 py-2 lg:w-full lg:justify-start"><Database />Data completeness</TabsTrigger>
+        <TabsTrigger value="guide" className="px-3 py-2 lg:w-full lg:justify-start"><FileJson />Criteria guide</TabsTrigger>
       </TabsList>
       <TabsContent value="classification">
         <SourceSectionTitle title="Four independent classification outputs" description="Computed deterministically from the source data in the other tabs. These four outputs are never merged into a single combined verdict phrase. The AI summary narrates each verbatim; it does not decide any of them." />
+        <QueryPerformance metadata={result.queryMetadata} />
         <div className="mt-4 grid gap-3 md:grid-cols-2">
           <VerdictCard
             title="(A) Germline pathogenicity (ACMG/AMP 2015)"
@@ -556,8 +880,35 @@ function EvidenceTabs({ result }: { result: VariantReviewResponse }) {
           ["Caveat", result.computationalPrediction.caveat],
         ]} />
       </TabsContent>
-      <TabsContent value="summary"><div className="mt-4 whitespace-pre-wrap rounded-lg border border-border bg-muted/35 p-4 text-sm leading-6">{result.aiSummary}</div></TabsContent>
+      <TabsContent value="summary">
+        <div className="mt-4 flex flex-col gap-3 rounded-lg border border-border bg-muted/35 p-4">
+          <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
+            <div><p className="font-medium">AI evidence narrative</p><p className="text-xs text-muted-foreground">Generated after deterministic results so it never blocks the evidence workspace.</p></div>
+            <Button variant="outline" onClick={onGenerateAi} disabled={isAiLoading || result.aiSummaryStatus === "generated"}>{isAiLoading ? <Loader2 data-icon="inline-start" className="animate-spin" /> : <Sparkles data-icon="inline-start" />}{result.aiSummaryStatus === "generated" ? "Generated" : "Generate narrative"}</Button>
+          </div>
+          <Separator />
+          <div className="whitespace-pre-wrap text-sm leading-6">{isAiLoading ? "Evidence is ready. Generating the optional narrative…" : result.aiSummary}</div>
+        </div>
+      </TabsContent>
     </Tabs>
+  );
+}
+
+function SourceNavLabel({ label, status }: { label: string; status: SourceStatus }) {
+  const color = status === "available" ? "bg-emerald-400" : status === "query_failed" || status === "permission_denied" || status === "rate_limited" ? "bg-red-400" : "bg-amber-400";
+  return <><span>{label}</span><span className={`size-2 rounded-full ${color}`} aria-label={status} title={status} /></>;
+}
+
+function QueryPerformance({ metadata }: { metadata: VariantReviewResponse["queryMetadata"] }) {
+  const slowest = Object.entries(metadata.sourceMs).sort((a, b) => b[1] - a[1])[0];
+  return (
+    <div className="mt-4 grid gap-2 rounded-lg border border-primary/20 bg-primary/5 p-3 sm:grid-cols-4">
+      <div className="flex items-center gap-2 sm:col-span-4"><Gauge className="size-4 text-primary" /><p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Query performance</p></div>
+      <MiniFact label="Total evidence" value={`${metadata.totalMs.toFixed(0)} ms`} />
+      <MiniFact label="Normalization" value={`${metadata.normalizationMs.toFixed(0)} ms`} />
+      <MiniFact label="Evidence fan-out" value={`${metadata.evidenceMs.toFixed(0)} ms`} />
+      <MiniFact label="Slowest source" value={slowest ? `${slowest[0]} ${slowest[1].toFixed(0)} ms` : "n/a"} />
+    </div>
   );
 }
 

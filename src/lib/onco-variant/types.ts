@@ -24,6 +24,13 @@ export type VariantReviewRequest = {
   vaf?: string | number;
 };
 
+export type VariantReviewApiRequest = VariantReviewRequest & {
+  /** AI narration is intentionally opt-in so deterministic evidence can return immediately. */
+  includeAiSummary?: boolean;
+  /** Raw upstream payloads are large and are excluded by default, especially for VCF batches. */
+  includeRawEvidence?: boolean;
+};
+
 export type LiftedCoordinate = {
   chrom: string;
   pos: number;
@@ -487,4 +494,16 @@ export type VariantReviewResponse = {
   practicalImportPackage: PracticalImportPackage;
   classification: ClassificationResult;
   aiSummary: string;
+  aiSummaryStatus: "generated" | "deterministic" | "not_requested";
+  queryMetadata: {
+    totalMs: number;
+    normalizationMs: number;
+    evidenceMs: number;
+    classificationMs: number;
+    aiSummaryMs: number;
+    sourceMs: Record<string, number>;
+    generatedAt: string;
+  };
 };
+
+export type VariantReviewCore = Omit<VariantReviewResponse, "aiSummary" | "aiSummaryStatus" | "queryMetadata">;

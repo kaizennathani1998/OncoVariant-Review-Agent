@@ -12,7 +12,7 @@ export class HttpError extends Error {
   }
 }
 
-export async function fetchJson<T>(input: URL, init?: RequestInit, timeoutMs = 12000): Promise<T> {
+export async function fetchJson<T>(input: URL, init?: RequestInit, timeoutMs = 6000): Promise<T> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {

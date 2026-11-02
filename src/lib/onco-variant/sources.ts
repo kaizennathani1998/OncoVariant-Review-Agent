@@ -11,28 +11,110 @@ const CIVIC_API = "https://civicdb.org/api/graphql";
 const COSMIC_BASE = "https://cancer.sanger.ac.uk/cosmic";
 const COSMIC_CLINICAL_TABLES = "https://clinicaltables.nlm.nih.gov/api/cosmic/v4/search";
 const MAX_STUDIES_QUERIED = 8;
+const CBIO_STUDY_CONCURRENCY = 4;
+const CBIO_STUDIES_TTL_MS = 5 * 60 * 1000;
+const CBIO_QUERY_CACHE_TTL_MS = 10 * 60 * 1000;
 const PREFERRED_REFSEQ_TRANSCRIPTS: Record<string, string> = {
   TP53: "NM_000546.6",
 };
 const entrezGeneIdCache = new Map<string, number | null>();
+const entrezGeneIdInFlight = new Map<string, Promise<number | null>>();
 const refSeqTranscriptCache = new Map<string, string | null>();
+let cbioStudiesCache: { expiresAt: number; value: Array<Record<string, unknown>> } | undefined;
+let cbioStudiesInFlight: Promise<Array<Record<string, unknown>>> | undefined;
+const cbioStudyConfigCache = new Map<string, { expiresAt: number; promise: Promise<{
+  molecularProfileId?: string;
+  sampleListId?: string;
+  sampleList?: Record<string, unknown>;
+}> }>();
+const cbioMutationCache = new Map<string, { expiresAt: number; promise: Promise<Array<Record<string, unknown>>> }>();
 type GnomadPopulation = NonNullable<GnomadResult["populations"]>[number];
+
+async function getCbioStudies() {
+  if (cbioStudiesCache && cbioStudiesCache.expiresAt > Date.now()) return cbioStudiesCache.value;
+  if (cbioStudiesInFlight) return cbioStudiesInFlight;
+  const studiesUrl = new URL("/api/studies", CBIO_BASE);
+  studiesUrl.searchParams.set("projection", "SUMMARY");
+  cbioStudiesInFlight = fetchJson<Array<Record<string, unknown>>>(studiesUrl)
+    .then((value) => {
+      cbioStudiesCache = { expiresAt: Date.now() + CBIO_STUDIES_TTL_MS, value };
+      return value;
+    })
+    .finally(() => {
+      cbioStudiesInFlight = undefined;
+    });
+  return cbioStudiesInFlight;
+}
+
+function getCbioStudyConfig(studyId: string) {
+  return cachedPromise(cbioStudyConfigCache, studyId, CBIO_QUERY_CACHE_TTL_MS, async () => {
+    const [molecularProfiles, sampleLists] = await Promise.all([
+      fetchJson<Array<Record<string, unknown>>>(new URL(`/api/studies/${studyId}/molecular-profiles?projection=SUMMARY`, CBIO_BASE)),
+      fetchJson<Array<Record<string, unknown>>>(new URL(`/api/studies/${studyId}/sample-lists?projection=SUMMARY`, CBIO_BASE)),
+    ]);
+    const mutationProfile = molecularProfiles.find((profile) => readString(profile, ["molecularAlterationType"]) === "MUTATION_EXTENDED");
+    const sampleList = selectSampleList(sampleLists);
+    return {
+      molecularProfileId: readString(mutationProfile, ["molecularProfileId"]),
+      sampleListId: readString(sampleList, ["sampleListId"]),
+      sampleList,
+    };
+  });
+}
+
+function getCbioGeneMutations(molecularProfileId: string, sampleListId: string, entrezGeneId: number) {
+  const key = `${molecularProfileId}:${sampleListId}:${entrezGeneId}`;
+  return cachedPromise(cbioMutationCache, key, CBIO_QUERY_CACHE_TTL_MS, async () => {
+    const mutationsUrl = new URL(`/api/molecular-profiles/${molecularProfileId}/mutations/fetch`, CBIO_BASE);
+    mutationsUrl.searchParams.set("projection", "DETAILED");
+    return fetchJson<Array<Record<string, unknown>>>(mutationsUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ entrezGeneIds: [entrezGeneId], sampleListId }),
+    });
+  });
+}
+
+function cachedPromise<T>(
+  cache: Map<string, { expiresAt: number; promise: Promise<T> }>,
+  key: string,
+  ttlMs: number,
+  operation: () => Promise<T>,
+) {
+  const cached = cache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.promise;
+  const promise = operation().catch((error) => {
+    cache.delete(key);
+    throw error;
+  });
+  cache.set(key, { expiresAt: Date.now() + ttlMs, promise });
+  if (cache.size > 500) cache.delete(cache.keys().next().value as string);
+  return promise;
+}
 
 async function resolveEntrezGeneId(gene: string): Promise<number | null> {
   const key = gene.toUpperCase();
   if (entrezGeneIdCache.has(key)) return entrezGeneIdCache.get(key) ?? null;
-  try {
-    const data = await fetchJson<Record<string, unknown>>(new URL(`/api/genes/${encodeURIComponent(key)}`, CBIO_BASE));
-    const id = readNumber(data, ["entrezGeneId"]) ?? null;
-    entrezGeneIdCache.set(key, id);
-    return id;
-  } catch (error) {
-    if (error instanceof HttpError && error.status === 404) {
-      entrezGeneIdCache.set(key, null);
-      return null;
+  const existing = entrezGeneIdInFlight.get(key);
+  if (existing) return existing;
+  const promise = (async () => {
+    try {
+      const data = await fetchJson<Record<string, unknown>>(new URL(`/api/genes/${encodeURIComponent(key)}`, CBIO_BASE));
+      const id = readNumber(data, ["entrezGeneId"]) ?? null;
+      entrezGeneIdCache.set(key, id);
+      return id;
+    } catch (error) {
+      if (error instanceof HttpError && error.status === 404) {
+        entrezGeneIdCache.set(key, null);
+        return null;
+      }
+      throw error;
+    } finally {
+      entrezGeneIdInFlight.delete(key);
     }
-    throw error;
-  }
+  })();
+  entrezGeneIdInFlight.set(key, promise);
+  return promise;
 }
 
 export async function resolveRefSeqTranscript(gene: string): Promise<string | undefined> {
@@ -304,9 +386,7 @@ export async function queryOncoKb(variant: NormalizedVariant): Promise<OncoKbRes
 export async function queryCbioPortal(variant: NormalizedVariant): Promise<CbioPortalResult> {
   const queriedStudies: CbioPortalResult["queriedStudies"] = [];
   try {
-    const studiesUrl = new URL("/api/studies", CBIO_BASE);
-    studiesUrl.searchParams.set("projection", "SUMMARY");
-    const studies = await fetchJson<Array<Record<string, unknown>>>(studiesUrl);
+    const studies = await getCbioStudies();
     const selectedStudies = selectRelevantStudies(studies, variant).slice(0, MAX_STUDIES_QUERIED);
     return await queryCbioPortalSelectedStudies(variant, selectedStudies, queriedStudies, {
       unavailableMessage: "cBioPortal lookup requires a gene symbol.",
@@ -321,9 +401,7 @@ export async function queryCbioPortal(variant: NormalizedVariant): Promise<CbioP
 export async function queryAacrGenie(variant: NormalizedVariant): Promise<GenieResult> {
   const queriedStudies: CbioPortalResult["queriedStudies"] = [];
   try {
-    const studiesUrl = new URL("/api/studies", CBIO_BASE);
-    studiesUrl.searchParams.set("projection", "SUMMARY");
-    const studies = await fetchJson<Array<Record<string, unknown>>>(studiesUrl);
+    const studies = await getCbioStudies();
     const selectedStudies = studies
       .filter((study) => {
         const haystack = [readString(study, ["studyId"]), readString(study, ["name"]), readString(study, ["description"])].join(" ").toLowerCase();
@@ -355,28 +433,29 @@ async function queryCbioPortalSelectedStudies(
       return notFoundCbio(`Gene "${variant.gene}" was not found in cBioPortal's gene list.`, queriedStudies);
     }
 
-    const studyResults = [];
-    for (const study of selectedStudies) {
+    const studyResults: Array<{
+      studyId: string;
+      name: string;
+      cancerType?: string;
+      sampleCount?: number;
+      mutationCount: number;
+      matchingProteinChanges: string[];
+      approximateMatches: boolean;
+      link: string;
+      mutationFrequency: string;
+      sampleLevelEvidence: Array<{ sampleId: string; mutationStatus?: string; vaf?: number }>;
+      rawMatches: Array<Record<string, unknown>>;
+    }> = [];
+    await mapWithConcurrency(selectedStudies, CBIO_STUDY_CONCURRENCY, async (study) => {
       const studyId = readString(study, ["studyId"]);
-      if (!studyId) continue;
+      if (!studyId) return;
       try {
-        const molecularProfiles = await fetchJson<Array<Record<string, unknown>>>(new URL(`/api/studies/${studyId}/molecular-profiles?projection=SUMMARY`, CBIO_BASE));
-        const mutationProfile = molecularProfiles.find((profile) => readString(profile, ["molecularAlterationType"]) === "MUTATION_EXTENDED");
-        const molecularProfileId = readString(mutationProfile, ["molecularProfileId"]);
-        const sampleLists = await fetchJson<Array<Record<string, unknown>>>(new URL(`/api/studies/${studyId}/sample-lists?projection=SUMMARY`, CBIO_BASE));
-        const sampleList = selectSampleList(sampleLists);
-        const sampleListId = readString(sampleList, ["sampleListId"]);
+        const { molecularProfileId, sampleListId, sampleList } = await getCbioStudyConfig(studyId);
         if (!molecularProfileId || !sampleListId) {
           queriedStudies.push({ studyId, name: readString(study, ["name"]), status: "skipped", message: "No mutation profile or sequenced sample list was available." });
-          continue;
+          return;
         }
-        const mutationsUrl = new URL(`/api/molecular-profiles/${molecularProfileId}/mutations/fetch`, CBIO_BASE);
-        mutationsUrl.searchParams.set("projection", "DETAILED");
-        const mutations = await fetchJson<Array<Record<string, unknown>>>(mutationsUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ entrezGeneIds: [entrezGeneId], sampleListId }),
-        });
+        const mutations = await getCbioGeneMutations(molecularProfileId, sampleListId, entrezGeneId);
         const matches = mutations.map((mutation) => {
           const observedProtein = readString(mutation, ["proteinChange", "aminoAcidChange"]) ?? "";
           const proteinMatch = variant.proteinChangeCandidates.length ? isProteinMatch(observedProtein, variant.proteinChangeCandidates) : { matched: true, approximate: false };
@@ -404,7 +483,10 @@ async function queryCbioPortalSelectedStudies(
       } catch (error) {
         queriedStudies.push({ studyId, name: readString(study, ["name"]), status: "error", message: errorMessage(error) });
       }
-    }
+    });
+
+    queriedStudies.sort((a, b) => a.studyId.localeCompare(b.studyId));
+    studyResults.sort((a, b) => a.studyId.localeCompare(b.studyId));
 
     const matchingStudies = studyResults.map((study) => {
       const { rawMatches, ...publicStudy } = study;
@@ -751,6 +833,17 @@ function readSampleCount(sampleList: unknown) {
 function parseCountFromText(value?: string) {
   const match = value?.match(/\(([\d,]+)\s+samples?\)/i) ?? value?.match(/([\d,]+)\s+samples?/i);
   return match ? Number(match[1].replace(/,/g, "")) || undefined : undefined;
+}
+
+async function mapWithConcurrency<T>(items: T[], concurrency: number, operation: (item: T) => Promise<void>) {
+  let nextIndex = 0;
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (nextIndex < items.length) {
+      const index = nextIndex++;
+      await operation(items[index]);
+    }
+  });
+  await Promise.all(workers);
 }
 
 function errorMessage(error: unknown) {
